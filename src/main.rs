@@ -1,29 +1,32 @@
-use reqwest::Client;
-use serde::{Serialize, Deserialize};
-use reqwest_eventsource::RequestBuilderExt;
-use reqwest_eventsource::EventsourceRequestBuilder;
-use futures::stream::StreamExt;
-use futures::executor::block_on;
-
-
 use gst::prelude::*;
 use gst_webrtc::{WebRTCSessionDescription, WebRTCSDPType};
 use gst_sdp::sdp_message::SDPMessage;
 
-const URL_SSE: &str = "http://localhost:8000/events";
-const URL_MESSAGES: &str = "http://localhost:8000/message";
+mod services;
+use services::*;
 
-fn prepare() -> Box<gst::Pipeline> {
+fn prepare_pipeline() -> Result<Box<gst::Pipeline>, gst::glib::Error> {
     // Initialize gstreamer
-    gst::init().unwrap();
+    if let Err(e) = gst::init() {
+        eprintln!("Could not initialize gstreamer");
+        return Err(e);
+    }
 
     // Build the pipeline
-    let pipeline = gst::parse_launch(&format!("videotestsrc ! videoconvert ! videoscale ! video/x-raw,width=1920,height=1080,framerate=30/1 ! x264enc tune=zerolatency ! video/x-h264,profile=baseline ! rtph264pay ! application/x-rtp,media=video,encoding-name=H264,payload=96 ! tee name=videotee ! queue ! fakesink")).unwrap();
+    let pipeline = match gst::parse_launch(&format!("videotestsrc ! videoconvert ! videoscale ! video/x-raw,width=1920,height=1080,framerate=30/1 ! x264enc tune=zerolatency ! video/x-h264,profile=baseline ! rtph264pay ! application/x-rtp,media=video,encoding-name=H264,payload=96 ! tee name=videotee ! queue ! fakesink")) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to parse initial pipeline");
+            return Err(e);
+        }
+    };
+
     //let pipeline = gst::parse_launch(&format!("v4l2src device=/dev/video1 ! videoconvert ! videoscale ! video/x-raw,width=1920,height=1080,framerate=30/1 ! x264enc tune=zerolatency ! video/x-h264,profile=baseline ! rtph264pay ! application/x-rtp,media=video,encoding-name=H264,payload=96 ! tee name=videotee ! queue ! fakesink")).unwrap();
-    Box::new(pipeline.dynamic_cast::<gst::Pipeline>().unwrap())
+
+    Ok(Box::new(pipeline.dynamic_cast::<gst::Pipeline>().unwrap()))
 }
 
-fn add_webrtc(client: &Box<Client>, identifier: String,  pipeline: &Box::<gst::Pipeline>) {
+fn add_webrtc(services: &Box<Services>, identifier: &String,  pipeline: &Box::<gst::Pipeline>) {
     println!("Adding Webrtc node");
 
     if let Some(_webrtc) = pipeline.by_name(format!("webrtc-{}", identifier).as_str()) {
@@ -47,30 +50,24 @@ fn add_webrtc(client: &Box<Client>, identifier: String,  pipeline: &Box::<gst::P
 
     {
         let w = webrtc.clone();
-        let client = client.clone();
+        let services = services.clone();
         let identifier = identifier.clone();
         webrtc.connect("on-negotiation-needed", false, move |_| {
             println!("Negociation needed");
-            on_negotiation_needed(&client, identifier.clone(), &w);
+            on_negotiation_needed(&services, identifier.clone(), &w);
             None
         });
     }
 
     {
-        let client = client.clone();
+        let services = services.clone();
+        let identifier = identifier.clone();
         webrtc.connect("on-ice-candidate", false, move |values| {
             println!("ICE Candidate created");
             let sdp_mline_index = values[1].get::<u32>().expect("Invalid argument");
             let candidate = values[2].get::<String>().expect("Invalid argument");
 
-            send_message(&client, &OutgoingMessage {
-                command: "ice_candidate".to_string(),
-                recipient: identifier.clone(),
-                sdp_type: None,
-                sdp: None,
-                ice_candidate_index: Some(sdp_mline_index),
-                ice_candidate: Some(candidate)
-            });
+            services.send_ice_candidate(&identifier, sdp_mline_index, candidate);
             println!("ICE Candidate sent");
             None
         });
@@ -89,9 +86,9 @@ fn remove_webrtc(identifier: String, pipeline: &Box::<gst::Pipeline>) {
     pipeline.remove_many(&[&queue, &webrtc]).unwrap();
 }
 
-fn on_negotiation_needed(client: &Box<Client>, identifier: String, webrtc: &Box::<gst::Element>) {
+fn on_negotiation_needed(services: &Box<Services>, identifier: String, webrtc: &Box::<gst::Element>) {
     let w = webrtc.clone();
-    let client = client.clone();
+    let services = services.clone();
     let promise = gst::Promise::with_change_func(move |reply| {
         let reply = match reply {
             Ok(Some(reply)) => reply,
@@ -118,14 +115,7 @@ fn on_negotiation_needed(client: &Box<Client>, identifier: String, webrtc: &Box:
         println!("SDP :\n{}", desc.sdp().as_text().unwrap());
 
         let promise = gst::Promise::with_change_func(move |_| {
-            send_message(&client, &OutgoingMessage {
-                command: "sdp_offer".to_string(),
-                recipient: identifier,
-                sdp_type: Some(String::from(desc.type_().to_str())),
-                sdp: Some(desc.sdp().as_text().unwrap()),
-                ice_candidate_index: None,
-                ice_candidate: None
-            });
+            services.send_sdp_offer(&identifier, desc.sdp().as_text().unwrap());
             println!("SDP Offer sent\n");
         });
         w.emit_by_name::<()>("set-local-description", &[&offer, &promise]);
@@ -133,157 +123,58 @@ fn on_negotiation_needed(client: &Box<Client>, identifier: String, webrtc: &Box:
     webrtc.emit_by_name::<()>("create-offer", &[&None::<gst::Structure>, &promise]);
 }
 
-fn on_sdp_anwer(identifier: String, answer: gst_webrtc::WebRTCSessionDescription, pipeline: &Box<gst::Pipeline>) {
+fn handle_sdp_anwer(identifier: &String, answer: gst_webrtc::WebRTCSessionDescription, pipeline: &Box<gst::Pipeline>) {
     println!("Setting remote description");
-    let pipe = pipeline.clone();
-    let ident = identifier.clone();
     let promise = gst::Promise::with_change_func(move |_| {
         println!("Remote description set");
-        let promise = gst::Promise::with_change_func(move |reply| {
-            println!("Webrtc stats ");
-        });
-        let webrtc = pipe.by_name(format!("webrtc-{}", ident).as_str()).unwrap();
-        webrtc.emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
     });
     let webrtc = pipeline.by_name(format!("webrtc-{}", identifier).as_str()).unwrap();
     webrtc.emit_by_name::<()>("set-remote-description", &[&answer, &promise]);
 }
 
-fn on_ice_candidate(
-    identifier: String,
-    sdp_mline_index: u32,
-    candidate: &str,
-    pipeline: &Box<gst::Pipeline>) {
-
+fn handle_ice_candidate(identifier: &String, sdp_mline_index: u32, candidate: &str, pipeline: &Box<gst::Pipeline>) {
     let webrtc = pipeline.by_name(format!("webrtc-{}", identifier).as_str()).unwrap();
     webrtc.emit_by_name::<()>("add-ice-candidate", &[&sdp_mline_index, &candidate]);
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde()]
-struct IncomingMessage {
-    pub command: String,
-    pub sender: String,
-    pub sdp_type: Option<String>,
-    pub sdp: Option<String>,
-    pub ice_candidate_index: Option<u32>,
-    pub ice_candidate: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde()]
-struct OutgoingMessage {
-    pub command: String,
-    pub recipient: String,
-    pub sdp_type: Option<String>,
-    pub sdp: Option<String>,
-    pub ice_candidate_index: Option<u32>,
-    pub ice_candidate: Option<String>,
-}
-
-fn send_message(client: &Box<Client>, message: &OutgoingMessage) {
-    let response = client
-        .post(URL_MESSAGES)
-        .json(&message)
-        .send();
-
-    let _response = match block_on(response) {
-        Ok(response) => response,
-        Err(error) => panic!("Problem sending the message:\n {:?}", error),
-    };
-}
-
-fn camera_ping(client: &Box<Client>) {
-    send_message(client, &OutgoingMessage {
-        command: "camera_ping".to_string(),
-        recipient: "".to_string(),
-        sdp_type: None,
-        sdp: None,
-        ice_candidate_index: None,
-        ice_candidate: None
-    });
-    println!("Camera ping sent");
-}
-
 #[tokio::main]
 async fn main() {
-    let pipeline: Box<gst::Pipeline> = prepare();
-
-    let client = Box::new(Client::builder()
-        .cookie_store(true)
-        .build()
-        .unwrap());
-
-    let mut stream = client
-        .get(URL_SSE)
-        .eventsource()
-        .unwrap();
-
-    while let Some(event) = stream.next().await {
-        match event {
-            Ok(event) => {
-                let message: IncomingMessage = serde_json::from_str(&event.data).expect("JSON was not well-formatted");
-                print!("\nIncoming message from {}: ", message.sender);
-                if message.command == "list_cameras" {
-                    println!("Camera list");
-                    camera_ping(&client);
-                } else if message.command == "call" {
-                    println!("Call");
-                    add_webrtc(&client, message.sender, &pipeline);
-                } else if message.command == "end" {
-                    println!("Call ended");
-                    remove_webrtc(message.sender, &pipeline);
-                } else if message.command == "sdp_answer" {
-                    println!("New incoming SDP message:");
-                    println!("{:?}", &message.sdp_type);
-                    println!("{:?}", &message.sdp);
-                    let sdp_type = match message.sdp_type {
-                        Some(t) => t,
-                        None => {
-                            println!("Error: No SDP Type !");
-                            return;
-                        }
-                    };
-                    let sdp_type = match sdp_type.as_str() {
-                        "offer" => WebRTCSDPType::Offer,
-                        "pranswer" => WebRTCSDPType::Pranswer,
-                        "answer" => WebRTCSDPType::Answer,
-                        "rollback" => WebRTCSDPType::Rollback,
-                        _ => {
-                            println!("Error: Unknown SDP Type !");
-                            return;
-                        }
-                    };
-
-                    let sdp = match SDPMessage::parse_buffer(&message.sdp.unwrap().as_bytes()) {
-                        Ok(r) => r,
-                        Err(err) => { 
-                            println!("Error: Can't parse SDP Description !");
-                            println!("{}", err);
-                            return;
-                        }
-                    };
-                    on_sdp_anwer(message.sender, WebRTCSessionDescription::new(sdp_type, sdp), &pipeline);
-                } else if message.command == "ice_candidate" {
-                    println!("New incoming ICE candidate:");
-                    println!("{:?}", &message.ice_candidate);
-                    let index = match message.ice_candidate_index {
-                        Some(i) => i,
-                        None => return
-                    };
-                    let candidate = match &message.ice_candidate {
-                        Some(c) => c,
-                        None => return
-                    };
-                    on_ice_candidate(message.sender, index, candidate.as_str(), &pipeline);
-                } else {
-                    println!("Unknown command :\n{:?}", message);
-                }
-            },
-            Err(error) => {
-                println!("Error: {:?}", error);
-            }
+    let pipeline = match prepare_pipeline() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to initialize pipeline:\n{:?}", e);
+            return;
         }
+    };
+
+    let services = Box::new(Services::new("http://localhost:8000/".to_string()));
+    {
+        let pipeline = &pipeline.clone();
+        let services = &services.clone();
+        services.start_sse(move |message| {
+            services.send_camera_ping(&message.sender);
+            println!("Camera ping sent");
+        }, move |message| {
+            println!("Call");
+            add_webrtc(&services, &message.sender, &pipeline);
+        }, move |message| {
+            println!("New incoming SDP message:");
+            println!("{:?}", &message.description);
+
+            let sdp = match SDPMessage::parse_buffer(&message.description.as_bytes()) {
+                Ok(r) => r,
+                Err(err) => { 
+                    println!("Error: Can't parse SDP Description !");
+                    println!("{:?}", err);
+                    return;
+                }
+            };
+            handle_sdp_anwer(&message.sender, WebRTCSessionDescription::new(WebRTCSDPType::Answer, sdp), &pipeline);
+        }, move |message| {
+            println!("New incoming ICE candidate:");
+            println!("{:?}", &message.candidate);
+            handle_ice_candidate(&message.sender, message.index, message.candidate.as_str(), &pipeline);
+        }).await;
     }
 
     // Shutdown pipeline
