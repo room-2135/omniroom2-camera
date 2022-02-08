@@ -113,7 +113,7 @@ impl Services {
                 Ok(event) => {
                     let message: GenericIncomingMessage = serde_json::from_str(&event.data).expect("JSON was not well-formatted");
                     match message.command.as_str() {
-                        "camera_ping" => {
+                        "camera_discovery" => {
                             on_camera_ping(&message);
                         }
                         "call_init" => {
