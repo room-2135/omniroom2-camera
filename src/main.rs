@@ -13,7 +13,7 @@ fn prepare_pipeline() -> Result<Box<gst::Pipeline>, gst::glib::Error> {
     }
 
     // Build the pipeline
-    let pipeline = match gst::parse_launch(&format!("v4l2src device=/dev/video1 ! videoconvert ! videoscale ! video/x-raw,width=1920,height=1080,framerate=30/1 ! x264enc tune=zerolatency ! video/x-h264,profile=baseline ! rtph264pay ! tee name=videotee ! queue ! fakesink")) {
+    let pipeline = match gst::parse_launch(&format!("v4l2src device=/dev/video1 ! videoconvert ! videoscale ! video/x-raw,width=1920,height=1080,framerate=30/1 ! x264enc tune=zerolatency ! video/x-h264,profile=high ! rtph264pay ! tee name=videotee ! queue ! fakesink")) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Failed to parse initial pipeline");
