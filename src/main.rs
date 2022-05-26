@@ -5,7 +5,9 @@ use gst_sdp::sdp_message::SDPMessage;
 mod services;
 use services::*;
 
-fn prepare_pipeline() -> Result<Box<gst::Pipeline>, gst::glib::Error> {
+use clap::Parser;
+
+fn prepare_pipeline(video_base: String, audio_base: String) -> Result<Box<gst::Pipeline>, gst::glib::Error> {
     // Initialize gstreamer
     if let Err(e) = gst::init() {
         eprintln!("Could not initialize gstreamer");
@@ -13,7 +15,7 @@ fn prepare_pipeline() -> Result<Box<gst::Pipeline>, gst::glib::Error> {
     }
 
     // Build the pipeline
-    let pipeline = match gst::parse_launch(&format!("v4l2src device=/dev/video1 ! videoconvert ! videoscale ! video/x-raw,width=1920,height=1080,framerate=30/1 ! x264enc tune=zerolatency ! video/x-h264,profile=high ! rtph264pay ! tee name=videotee ! queue ! fakesink")) {
+    let pipeline = match gst::parse_launch(&format!("{} ! tee name=videotee ! queue ! fakesink {} ! tee name=audiotee ! queue ! fakesink", video_base, audio_base)) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Failed to parse initial pipeline");
@@ -32,19 +34,31 @@ fn add_webrtc(services: &Box<Services>, identifier: &String,  pipeline: &Box::<g
         remove_webrtc(identifier, pipeline);
     }
 
-    let tee = pipeline.by_name("videotee").unwrap();
-    let queue =  gst::ElementFactory::make("queue", Some(format!("queue-{}", identifier).as_str())).expect("");
+    let video_tee = pipeline.by_name("videotee").unwrap();
+    let audio_tee = pipeline.by_name("audiotee").unwrap();
+    let video_queue =  gst::ElementFactory::make("queue", Some(format!("video_queue-{}", identifier).as_str())).expect("");
+    let audio_queue =  gst::ElementFactory::make("queue", Some(format!("audio_queue-{}", identifier).as_str())).expect("");
     let webrtc = Box::new(gst::ElementFactory::make("webrtcbin", Some(format!("webrtc-{}", identifier).as_str())).expect(""));
 
-    pipeline.add_many(&[&queue, &webrtc]).unwrap();
+    pipeline.add_many(&[&video_queue, &audio_queue, &webrtc]).unwrap();
     {
         let sinkpad = webrtc.request_pad_simple("sink_%u").unwrap();
-        let srcpad = queue.static_pad("src").unwrap();
+        let srcpad = video_queue.static_pad("src").unwrap();
         srcpad.link(&sinkpad).unwrap();
     }
     {
-        let sinkpad = queue.static_pad("sink").unwrap();
-        let srcpad = tee.request_pad_simple("src_%u").unwrap();
+        let sinkpad = webrtc.request_pad_simple("sink_%u").unwrap();
+        let srcpad = audio_queue.static_pad("src").unwrap();
+        srcpad.link(&sinkpad).unwrap();
+    }
+    {
+        let sinkpad = video_queue.static_pad("sink").unwrap();
+        let srcpad = video_tee.request_pad_simple("src_%u").unwrap();
+        srcpad.link(&sinkpad).unwrap();
+    }
+    {
+        let sinkpad = audio_queue.static_pad("sink").unwrap();
+        let srcpad = audio_tee.request_pad_simple("src_%u").unwrap();
         srcpad.link(&sinkpad).unwrap();
     }
 
@@ -81,9 +95,10 @@ fn add_webrtc(services: &Box<Services>, identifier: &String,  pipeline: &Box::<g
 
 fn remove_webrtc(identifier: String, pipeline: &Box::<gst::Pipeline>) {
     println!("Removing Webrtc node");
-    let queue = pipeline.by_name(format!("queue-{}",identifier).as_str()).unwrap();
+    let video_queue = pipeline.by_name(format!("video_queue-{}",identifier).as_str()).unwrap();
+    let audio_queue = pipeline.by_name(format!("audio_queue-{}",identifier).as_str()).unwrap();
     let webrtc = pipeline.by_name(format!("webrtc-{}",identifier).as_str()).unwrap();
-    pipeline.remove_many(&[&queue, &webrtc]).unwrap();
+    pipeline.remove_many(&[&video_queue, &audio_queue, &webrtc]).unwrap();
 }
 
 fn on_negotiation_needed(services: &Box<Services>, identifier: String, webrtc: &Box::<gst::Element>) {
@@ -139,9 +154,36 @@ fn handle_ice_candidate(identifier: &String, sdp_mline_index: u32, candidate: &s
     webrtc.emit_by_name::<()>("add-ice-candidate", &[&sdp_mline_index, &candidate]);
 }
 
+/// Simple program to greet a person
+#[derive(Parser, Debug)]
+#[clap(author, version, about, long_about = None)]
+struct Args {
+    /// Signaling server address
+    #[clap(long, default_value = "localhost")]
+    address: String,
+
+    /// Signaling server port
+    #[clap(long, default_value = "8000")]
+    port: u32,
+
+    /// Use SSL/TLS to contact Signaling server
+    #[clap(long)]
+    unsecure: bool,
+
+    /// Gstreamer video pipeline base
+    #[clap(long, default_value = "videotestsrc ! videoconvert ! queue ! x264enc tune=zerolatency ! video/x-h264,profile=high ! rtph264pay")]
+    video_base: String,
+
+    /// Gstreamer audio pipeline base
+    #[clap(long, default_value = "audiotestsrc ! audioconvert ! queue ! opusenc ! rtpopuspay")]
+    audio_base: String,
+}
+
 #[tokio::main]
 async fn main() {
-    let pipeline = match prepare_pipeline() {
+    let args = Args::parse();
+
+    let pipeline = match prepare_pipeline(args.video_base, args.audio_base) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Failed to initialize pipeline:\n{:?}", e);
@@ -149,7 +191,11 @@ async fn main() {
         }
     };
 
-    let services = Box::new(Services::new("http://localhost:8900/".to_string()));
+    let signaling_protocol = if args.unsecure {"http"} else {"https"};
+    let uri = format!("{}://{}:{}/", signaling_protocol, args.address, args.port);
+
+    println!("Connecting to signaling server with uri: {}", uri);
+    let services = Box::new(Services::new(uri));
     {
         let pipeline = &pipeline.clone();
         let services = &services.clone();
