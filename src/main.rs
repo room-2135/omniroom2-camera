@@ -1,4 +1,3 @@
-use futures::executor::block_on;
 use futures::StreamExt;
 
 use clap::Parser;
@@ -22,8 +21,8 @@ fn prepare_pipeline(
 
     // Build the pipeline
     let pipeline = match gst::parse_launch(&format!(
-        "{} ! tee name=videotee ! queue ! fakesink {} ! tee name=audiotee ! queue ! fakesink",
-        video_base, audio_base
+        "{} ! tee name=videotee ! queue ! fakesink",
+        video_base
     )) {
         Ok(p) => p,
         Err(e) => {
@@ -48,24 +47,21 @@ fn add_webrtc(services: &Box<Services>, identifier: &String, pipeline: &Box<gst:
     }
 
     let video_tee = pipeline.by_name("videotee").expect("Cant find videotee");
-    let audio_tee = pipeline.by_name("audiotee").expect("Cant find audiotee");
-    let video_queue = gst::ElementFactory::make(
+    let video_queue = gst::ElementFactory::make_with_name(
         "queue",
         Some(format!("video_queue-{}", identifier).as_str()),
     )
     .expect("Cant find video queue");
-    let audio_queue = gst::ElementFactory::make(
-        "queue",
-        Some(format!("audio_queue-{}", identifier).as_str()),
-    )
-    .expect("Cant find audio queue");
     let webrtc = Box::new(
-        gst::ElementFactory::make("webrtcbin", Some(format!("webrtc-{}", identifier).as_str()))
-            .expect("Cant find webrtc node"),
+        gst::ElementFactory::make_with_name(
+            "webrtcbin",
+            Some(format!("webrtc-{}", identifier).as_str()),
+        )
+        .expect("Cant find webrtc node"),
     );
 
     pipeline
-        .add_many(&[&video_queue, &audio_queue, &webrtc])
+        .add_many(&[&video_queue, &webrtc])
         .expect("Cant add nodes to pipeline");
     {
         let sinkpad = webrtc
@@ -75,27 +71,12 @@ fn add_webrtc(services: &Box<Services>, identifier: &String, pipeline: &Box<gst:
         srcpad.link(&sinkpad).expect("Cant link src to sink");
     }
     {
-        let sinkpad = webrtc
-            .request_pad_simple("sink_%u")
-            .expect("Cant find sink");
-        let srcpad = audio_queue.static_pad("src").expect("Cant find src");
-        srcpad.link(&sinkpad).expect("Cant link src to sink");
-    }
-    {
         let sinkpad = video_queue.static_pad("sink").expect("Cant find sink");
         let srcpad = video_tee
             .request_pad_simple("src_%u")
             .expect("Cant find src");
         srcpad.link(&sinkpad).expect("Cant link src to sink");
     }
-    {
-        let sinkpad = audio_queue.static_pad("sink").expect("Cant find sink");
-        let srcpad = audio_tee
-            .request_pad_simple("src_%u")
-            .expect("Cant find src");
-        srcpad.link(&sinkpad).expect("Cant link src to sink");
-    }
-
     {
         let w = webrtc.clone();
         let services = services.clone();
@@ -119,7 +100,9 @@ fn add_webrtc(services: &Box<Services>, identifier: &String, pipeline: &Box<gst:
             let services = services.clone();
             let identifier = identifier.clone();
             println!("ICE Candidate about to be sent !");
-            block_on(services.send_ice_candidate(&identifier, sdp_mline_index, candidate)).unwrap();
+            services
+                .send_ice_candidate(&identifier, sdp_mline_index, candidate)
+                .unwrap();
             println!("ICE Candidate sent");
             None
         });
@@ -136,14 +119,11 @@ fn remove_webrtc(identifier: String, pipeline: &Box<gst::Pipeline>) {
     let video_queue = pipeline
         .by_name(format!("video_queue-{}", identifier).as_str())
         .expect("Cant find videoqueue");
-    let audio_queue = pipeline
-        .by_name(format!("audio_queue-{}", identifier).as_str())
-        .expect("Cant find audioqueue");
     let webrtc = pipeline
         .by_name(format!("webrtc-{}", identifier).as_str())
         .expect("Cant find webrtc node");
     pipeline
-        .remove_many(&[&video_queue, &audio_queue, &webrtc])
+        .remove_many(&[&video_queue, &webrtc])
         .expect("Cant remove nodes from the pipeline");
 }
 
@@ -179,7 +159,9 @@ fn on_negotiation_needed(services: &Box<Services>, identifier: String, webrtc: &
 
         let promise = gst::Promise::with_change_func(move |_| {
             println!("SDP Offer about to be sent !");
-            block_on(services.send_sdp_offer(&identifier, desc.sdp().as_text().unwrap())).unwrap();
+            services
+                .send_sdp_offer(&identifier, desc.sdp().as_text().unwrap())
+                .unwrap();
             println!("SDP Offer sent\n");
         });
         w.emit_by_name::<()>("set-local-description", &[&offer, &promise]);
@@ -280,13 +262,11 @@ async fn main() {
                                 println!("Welcomed");
                                 services
                                     .send_new_camera()
-                                    .await
                                     .expect("Failed to send new camera event");
                             }
                             Payload::CameraDiscovery => {
                                 services
                                     .send_camera_ping(&message.sender)
-                                    .await
                                     .expect("Failed to send a camera ping");
                                 println!("Camera ping sent");
                             }

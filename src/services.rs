@@ -1,3 +1,5 @@
+use futures::executor::block_on;
+use gst::glib::MainContext;
 use serde::{Deserialize, Serialize};
 
 use reqwest::Client;
@@ -44,14 +46,15 @@ impl Services {
         Services { base_url, client }
     }
 
-    async fn send_message<T: Serialize>(&self, message: &T) -> Result<(), ServiceError> {
+    fn send_message<T: Serialize>(&self, message: &T) -> Result<(), ServiceError> {
         let response = self
             .client
             .post(format!("{}/message", self.base_url))
             .json(&message)
             .send();
 
-        match response.await {
+        let c = MainContext::new();
+        match c.block_on(response) {
             Ok(_response) => Ok(()),
             Err(error) => {
                 eprintln!("Problem sending the message:\n {:?}", error);
@@ -60,23 +63,21 @@ impl Services {
         }
     }
 
-    pub async fn send_new_camera(&self) -> Result<(), ServiceError> {
+    pub fn send_new_camera(&self) -> Result<(), ServiceError> {
         self.send_message(&OutgoingMessage {
             recipient: None,
             payload: Payload::NewCamera,
         })
-        .await
     }
 
-    pub async fn send_camera_ping(&self, recipient: &String) -> Result<(), ServiceError> {
+    pub fn send_camera_ping(&self, recipient: &String) -> Result<(), ServiceError> {
         self.send_message(&OutgoingMessage {
             recipient: Some(recipient.to_string()),
             payload: Payload::CameraPing,
         })
-        .await
     }
 
-    pub async fn send_sdp_offer(
+    pub fn send_sdp_offer(
         &self,
         recipient: &String,
         description: String,
@@ -85,20 +86,19 @@ impl Services {
             recipient: Some(recipient.to_string()),
             payload: Payload::SDP { description },
         })
-        .await
     }
 
-    pub async fn send_ice_candidate(
+    pub fn send_ice_candidate(
         &self,
         recipient: &String,
         index: u32,
         candidate: String,
     ) -> Result<(), ServiceError> {
+        println!("=======================");
         self.send_message(&OutgoingMessage {
             recipient: Some(recipient.to_string()),
             payload: Payload::ICE { index, candidate },
         })
-        .await
     }
 
     pub fn start_sse(&self) -> EventSource {
