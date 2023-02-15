@@ -92,6 +92,7 @@ fn add_webrtc(services: &Box<Services>, identifier: &String, pipeline: &Box<gst:
         let services = services.clone();
         let identifier = identifier.clone();
         webrtc.connect("on-ice-candidate", false, move |values| {
+            println!("=======================");
             println!("ICE Candidate created");
             let sdp_mline_index = values[1].get::<u32>().expect("Invalid argument");
             let candidate = values[2].get::<String>().expect("Invalid argument");
